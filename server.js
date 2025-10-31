@@ -1,4 +1,3 @@
-// === server.js ===
 const express = require("express");
 const cors = require("cors");
 const { MongoClient } = require("mongodb");
@@ -15,47 +14,45 @@ const uri =
   "mongodb+srv://saqlainmubarik10_db_user:MLjYzAAndgMb1FP8@cluster0.be1wphn.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
 
 const client = new MongoClient(uri);
-let occupationsCollection, visasCollection, usersCollection;
+
+// === Global collection references ===
+let occupationsCollection, visasCollection, usersCollection, configCollection;
 
 async function connectDB() {
   await client.connect();
-  const db = client.db("ADMigartions"); // ✅ make sure spelling matches your Atlas DB name
+  const db = client.db("ADMigartions");
   occupationsCollection = db.collection("Occupations");
   visasCollection = db.collection("Visas");
   usersCollection = db.collection("Users");
+  configCollection = db.collection("Config");
   console.log("✅ Connected to MongoDB Atlas");
 }
 
-// === BASIC TEST ROUTE ===
+// ========================================================================
+// BASIC TEST ROUTE
+// ========================================================================
 app.get("/", (req, res) => res.send("Server running 🚀"));
 
 // ========================================================================
 // 🧩 AUTH ROUTES (REGISTER + LOGIN)
 // ========================================================================
-
-// === REGISTER ===
 app.post("/api/register", async (req, res) => {
   try {
     const { fullName, email, mobile, password } = req.body;
-
     if (!fullName || !email || !mobile || !password) {
-      return res
-        .status(400)
-        .json({ success: false, message: "All fields are required." });
+      return res.status(400).json({ message: "All fields are required." });
     }
 
     const existing = await usersCollection.findOne({ email });
     if (existing) {
-      return res
-        .status(409)
-        .json({ success: false, message: "Email already registered." });
+      return res.status(409).json({ message: "Email already registered." });
     }
 
     const newUser = {
       fullName,
       email,
       mobile,
-      password, // ⚠️ plain for now — for production use bcrypt
+      password,
       createdAt: new Date(),
     };
 
@@ -63,50 +60,31 @@ app.post("/api/register", async (req, res) => {
     res.json({ success: true, message: "Registration successful!" });
   } catch (err) {
     console.error("❌ Register error:", err);
-    res
-      .status(500)
-      .json({ success: false, message: "Server error during registration." });
+    res.status(500).json({ message: "Server error during registration." });
   }
 });
 
-// === LOGIN ===
 app.post("/api/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Email and password are required." });
-    }
+    if (!email || !password)
+      return res.status(400).json({ message: "Email and password are required." });
 
     const user = await usersCollection.findOne({ email });
-    if (!user) {
-      return res
-        .status(404)
-        .json({ success: false, message: "User not found. Please register first." });
-    }
-
-    if (user.password !== password) {
-      return res
-        .status(401)
-        .json({ success: false, message: "Incorrect password." });
-    }
+    if (!user) return res.status(404).json({ message: "User not found." });
+    if (user.password !== password)
+      return res.status(401).json({ message: "Incorrect password." });
 
     res.json({ success: true, message: "Login successful!", user });
   } catch (err) {
     console.error("❌ Login error:", err);
-    res
-      .status(500)
-      .json({ success: false, message: "Server error during login." });
+    res.status(500).json({ message: "Server error during login." });
   }
 });
 
 // ========================================================================
 // 🧩 OCCUPATION SEARCH ROUTES
 // ========================================================================
-
-// Search occupations by text/code
 app.get("/api/occupations/search", async (req, res) => {
   const { q } = req.query;
   try {
@@ -128,7 +106,9 @@ app.get("/api/occupations/search", async (req, res) => {
   }
 });
 
-// === MULTISEARCH ===
+// ========================================================================
+// 🧩 MULTISEARCH ROUTE — Dynamic visa list from DB
+// ========================================================================
 app.post("/api/multisearch", async (req, res) => {
   try {
     const { occupations } = req.body;
@@ -136,20 +116,20 @@ app.post("/api/multisearch", async (req, res) => {
       return res.status(400).json({ error: "No occupations provided" });
     }
 
-    // Fetch occupations (and their visa arrays)
+    // === 1️⃣ Fetch selected occupations
     const occDocs = await occupationsCollection
       .find({ anzsco_code: { $in: occupations } })
       .project({ anzsco_code: 1, visas: 1 })
       .toArray();
 
-    // Collect all unique visa codes
-    const visaCodes = [
-      ...new Set(occDocs.flatMap((occ) => occ.visas || [])),
-    ];
+    // Normalize occupation visa codes to strings
+    occDocs.forEach((occ) => {
+      occ.visas = (occ.visas || []).map((v) => String(v).trim());
+    });
 
-    // Fetch visa documents for those codes
-    const visas = await visasCollection
-      .find({ visa_code: { $in: visaCodes } })
+    // === 2️⃣ Fetch all visa codes dynamically from DB
+    const allVisaDocs = await visasCollection
+      .find({})
       .project({
         _id: 0,
         visa_code: 1,
@@ -159,21 +139,42 @@ app.post("/api/multisearch", async (req, res) => {
       })
       .toArray();
 
-    // Build matrix
-    const matrix = visas.map((visa) => {
+    // Normalize all visa codes to strings
+    allVisaDocs.forEach((v) => {
+      v.visa_code = String(v.visa_code).trim();
+    });
+
+    // Combine all visa codes found in DB and in occupations
+    const foundVisaCodes = [
+      ...new Set(occDocs.flatMap((occ) => occ.visas || [])),
+    ];
+    const allVisaCodes = Array.from(
+      new Set([...allVisaDocs.map((v) => v.visa_code), ...foundVisaCodes])
+    );
+
+    // === 3️⃣ Build the final eligibility matrix
+    const matrix = allVisaCodes.map((code) => {
+      const visa = allVisaDocs.find((v) => v.visa_code === code) || {};
       const row = {
-        visa_code: visa.visa_code,
-        visa_name: visa.visa_name,
-        legislative_instrument: visa.legislative_instrument,
-        occupation_list_type: visa.occupation_list_type,
+        visa_code: code,
+        visa_name: visa.visa_name || `Subclass ${code}`,
+        legislative_instrument: visa.legislative_instrument || "",
+        occupation_list_type: visa.occupation_list_type || "",
         eligibility: {},
       };
-      occupations.forEach((code) => {
-        const occ = occDocs.find((o) => o.anzsco_code === code);
-        row.eligibility[code] = occ?.visas?.includes(visa.visa_code) || false;
+
+      occupations.forEach((anzsco) => {
+        const occ = occDocs.find((o) => o.anzsco_code === anzsco);
+        row.eligibility[anzsco] = occ?.visas
+          ?.map((v) => String(v))
+          .includes(String(code));
       });
+
       return row;
     });
+
+    // Sort numerically by visa_code (189 → 190 → 482 ...)
+    matrix.sort((a, b) => Number(a.visa_code) - Number(b.visa_code));
 
     res.json(matrix);
   } catch (err) {
@@ -183,30 +184,8 @@ app.post("/api/multisearch", async (req, res) => {
 });
 
 // ========================================================================
-// 🧩 STATIC PAGE BY SUBCLASS
+// 🧩 STATE SEARCH (Visa by region)
 // ========================================================================
-app.get("/api/visas/:subclass", async (req, res) => {
-  try {
-    const subclass = req.params.subclass;
-    const page = await client
-      .db("ADMigartions")
-      .collection("StaticPages")
-      .findOne({ subclass }, { projection: { _id: 0 } });
-
-    if (!page) return res.status(404).json({ error: "Visa page not found" });
-
-    res.json(page);
-  } catch (err) {
-    console.error("❌ Error fetching static page:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ========================================================================
-// 🧩 STATE SEARCH (Show all visa types, mark eligibility by region)
-// ========================================================================
-// === STATE SEARCH (Show ALL visa types; ✔/✖ depends on region) ===
-// === STATE SEARCH (Show all visa columns, only occupations belonging to the region) ===
 app.get("/api/state/:code", async (req, res) => {
   try {
     const { code } = req.params;
@@ -216,10 +195,8 @@ app.get("/api/state/:code", async (req, res) => {
     const limitNum = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
     const skip = (pageNum - 1) * limitNum;
 
-    // 🧱 Always show these visa subclasses as columns
     const ALL_VISA_CODES = ["189", "190", "482", "491", "494", "186", "485", "407"];
 
-    // === Step 1: Fetch visa metadata (for header display)
     const visaDocs = await visasCollection
       .find({ visa_code: { $in: ALL_VISA_CODES } })
       .project({ _id: 0, visa_code: 1, visa_name: 1 })
@@ -230,9 +207,8 @@ app.get("/api/state/:code", async (req, res) => {
       return { visa_code: v, visa_name: doc?.visa_name || `Subclass ${v}` };
     });
 
-    // === Step 2: Occupation query (only those tagged for this region)
     const queryFilter = {
-      regions: code, // strictly belongs to this region
+      regions: code,
       ...(q
         ? {
             $or: [
@@ -250,7 +226,7 @@ app.get("/api/state/:code", async (req, res) => {
           _id: 0,
           anzsco_code: 1,
           title: 1,
-          visas: 1, // we’ll use this for ✔ and ✖
+          visas: 1,
           regions: 1,
         })
         .skip(skip)
@@ -259,22 +235,17 @@ app.get("/api/state/:code", async (req, res) => {
       occupationsCollection.countDocuments(queryFilter),
     ]);
 
-    // === Step 3: Build table rows
     const rows = occupations.map((occ) => {
       const row = {
         anzsco_code: occ.anzsco_code,
         name: occ.title,
       };
-
       ALL_VISA_CODES.forEach((visaCode) => {
-        // ✔ if this occupation includes that visa *and* region matches
         const eligible =
           (occ.visas || []).includes(visaCode) &&
           (occ.regions || []).includes(code);
-
         row[`Subclass ${visaCode}`] = !!eligible;
       });
-
       return row;
     });
 
@@ -293,7 +264,7 @@ app.get("/api/state/:code", async (req, res) => {
 });
 
 // ========================================================================
-// 🧩 TASK SEARCH (Full-text search)
+// 🧩 TASK SEARCH
 // ========================================================================
 app.get("/api/task/search", async (req, res) => {
   try {
@@ -302,11 +273,9 @@ app.get("/api/task/search", async (req, res) => {
     const limitNum = Math.min(Math.max(parseInt(limit) || 10, 1), 50);
     const skip = (pageNum - 1) * limitNum;
 
-    const query =
-      q.trim().length > 0 ? { $text: { $search: q } } : {};
+    const query = q.trim().length > 0 ? { $text: { $search: q } } : {};
 
     const total = await occupationsCollection.countDocuments(query);
-
     const results = await occupationsCollection
       .find(query, q ? { score: { $meta: "textScore" } } : {})
       .project({
@@ -326,15 +295,70 @@ app.get("/api/task/search", async (req, res) => {
       .limit(limitNum)
       .toArray();
 
-    res.json({
-      total,
-      page: pageNum,
-      limit: limitNum,
-      results,
-    });
+    res.json({ total, page: pageNum, limit: limitNum, results });
   } catch (err) {
     console.error("❌ Task search error:", err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ========================================================================
+// 🧩 CONFIG ROUTES
+// ========================================================================
+app.get("/api/config", async (req, res) => {
+  try {
+    const all = await configCollection.find({}).project({ _id: 0 }).toArray();
+    res.json(all);
+  } catch (err) {
+    console.error("❌ Config fetch error:", err);
+    res.status(500).json({ error: "Server error while fetching config" });
+  }
+});
+
+app.get("/api/config/:key", async (req, res) => {
+  try {
+    const key = req.params.key;
+    const config = await configCollection.findOne(
+      { key },
+      { projection: { _id: 0, value: 1 } }
+    );
+    if (!config) return res.status(404).json({ error: "Config not found" });
+    res.json(config.value);
+  } catch (err) {
+    console.error("❌ Config key fetch error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ========================================================================
+// 🧩 VISA KEYS FROM CONFIG (optional)
+// ========================================================================
+app.get("/api/config/visa_keys/:subclass", async (req, res) => {
+  try {
+    const { subclass } = req.params;
+    const configDoc = await configCollection.findOne(
+      { visa_keys: { $exists: true } },
+      { projection: { _id: 0, visa_keys: 1 } }
+    );
+
+    if (!configDoc || !Array.isArray(configDoc.visa_keys)) {
+      return res.status(404).json({ error: "Visa keys not found in config" });
+    }
+
+    const visa = configDoc.visa_keys.find(
+      (v) => String(v.subclass) === String(subclass)
+    );
+
+    if (!visa) {
+      return res
+        .status(404)
+        .json({ error: `Visa subclass ${subclass} not found in visa_keys` });
+    }
+
+    res.status(200).json(visa);
+  } catch (err) {
+    console.error("❌ Error fetching visa from config:", err);
+    res.status(500).json({ error: "Server error while fetching visa details" });
   }
 });
 
