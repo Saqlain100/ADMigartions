@@ -1,61 +1,52 @@
+/**
+ * 🌏 Eibeyon Immigration Backend (Admin + Search + Pagination)
+ */
+const XLSX = require("xlsx");
 const express = require("express");
 const cors = require("cors");
 const { MongoClient } = require("mongodb");
 
 const app = express();
-const port = 8080;
+const port = process.env.PORT || 8080;
 
-// === Middleware ===
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 // === MongoDB Connection ===
 const uri =
   "mongodb+srv://saqlainmubarik10_db_user:MLjYzAAndgMb1FP8@cluster0.be1wphn.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
-
 const client = new MongoClient(uri);
 
-// === Global collection references ===
-let occupationsCollection, visasCollection, usersCollection, configCollection;
+let occupationsCollection, usersCollection, configCollection;
 
 async function connectDB() {
   await client.connect();
   const db = client.db("ADMigartions");
   occupationsCollection = db.collection("Occupations");
-  visasCollection = db.collection("Visas");
   usersCollection = db.collection("Users");
   configCollection = db.collection("Config");
   console.log("✅ Connected to MongoDB Atlas");
 }
 
 // ========================================================================
-// BASIC TEST ROUT
+// BASIC TEST ROUTE
 // ========================================================================
-app.get("/", (req, res) => res.send("Server running 🚀"));
+app.get("/", (req, res) => res.send("🌍 Eibeyon Server Running 🚀"));
 
 // ========================================================================
-// 🧩 AUTH ROUTES (REGISTER + LOGIN)
+// 🧩 AUTH ROUTES
 // ========================================================================
 app.post("/api/register", async (req, res) => {
   try {
     const { fullName, email, mobile, password } = req.body;
-    if (!fullName || !email || !mobile || !password) {
+    if (!fullName || !email || !mobile || !password)
       return res.status(400).json({ message: "All fields are required." });
-    }
 
     const existing = await usersCollection.findOne({ email });
-    if (existing) {
+    if (existing)
       return res.status(409).json({ message: "Email already registered." });
-    }
 
-    const newUser = {
-      fullName,
-      email,
-      mobile,
-      password,
-      createdAt: new Date(),
-    };
-
+    const newUser = { fullName, email, mobile, password, createdAt: new Date() };
     await usersCollection.insertOne(newUser);
     res.json({ success: true, message: "Registration successful!" });
   } catch (err) {
@@ -83,226 +74,6 @@ app.post("/api/login", async (req, res) => {
 });
 
 // ========================================================================
-// 🧩 OCCUPATION SEARCH ROUTES
-// ========================================================================
-app.get("/api/occupations/search", async (req, res) => {
-  const { q } = req.query;
-  try {
-    const query = {
-      $or: [
-        { title: { $regex: q, $options: "i" } },
-        { anzsco_code: { $regex: q, $options: "i" } },
-      ],
-    };
-    const data = await occupationsCollection
-      .find(query)
-      .project({ anzsco_code: 1, title: 1, skill_level: 1, _id: 0 })
-      .limit(20)
-      .toArray();
-    res.json(data);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Search failed" });
-  }
-});
-
-// ========================================================================
-// 🧩 MULTISEARCH ROUTE — Dynamic visa list from DB
-// ========================================================================
-app.post("/api/multisearch", async (req, res) => {
-  try {
-    const { occupations } = req.body;
-    if (!occupations || occupations.length === 0) {
-      return res.status(400).json({ error: "No occupations provided" });
-    }
-
-    // === 1️⃣ Fetch selected occupations
-    const occDocs = await occupationsCollection
-      .find({ anzsco_code: { $in: occupations } })
-      .project({ anzsco_code: 1, visas: 1 })
-      .toArray();
-
-    // Normalize occupation visa codes to strings
-    occDocs.forEach((occ) => {
-      occ.visas = (occ.visas || []).map((v) => String(v).trim());
-    });
-
-    // === 2️⃣ Fetch all visa codes dynamically from DB
-    const allVisaDocs = await visasCollection
-      .find({})
-      .project({
-        _id: 0,
-        visa_code: 1,
-        visa_name: 1,
-        legislative_instrument: 1,
-        occupation_list_type: 1,
-      })
-      .toArray();
-
-    // Normalize all visa codes to strings
-    allVisaDocs.forEach((v) => {
-      v.visa_code = String(v.visa_code).trim();
-    });
-
-    // Combine all visa codes found in DB and in occupations
-    const foundVisaCodes = [
-      ...new Set(occDocs.flatMap((occ) => occ.visas || [])),
-    ];
-    const allVisaCodes = Array.from(
-      new Set([...allVisaDocs.map((v) => v.visa_code), ...foundVisaCodes])
-    );
-
-    // === 3️⃣ Build the final eligibility matrix
-    const matrix = allVisaCodes.map((code) => {
-      const visa = allVisaDocs.find((v) => v.visa_code === code) || {};
-      const row = {
-        visa_code: code,
-        visa_name: visa.visa_name || `Subclass ${code}`,
-        legislative_instrument: visa.legislative_instrument || "",
-        occupation_list_type: visa.occupation_list_type || "",
-        eligibility: {},
-      };
-
-      occupations.forEach((anzsco) => {
-        const occ = occDocs.find((o) => o.anzsco_code === anzsco);
-        row.eligibility[anzsco] = occ?.visas
-          ?.map((v) => String(v))
-          .includes(String(code));
-      });
-
-      return row;
-    });
-
-    // Sort numerically by visa_code (189 → 190 → 482 ...)
-    matrix.sort((a, b) => Number(a.visa_code) - Number(b.visa_code));
-
-    res.json(matrix);
-  } catch (err) {
-    console.error("❌ Multisearch error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ========================================================================
-// 🧩 STATE SEARCH (Visa by region)
-// ========================================================================
-app.get("/api/state/:code", async (req, res) => {
-  try {
-    const { code } = req.params;
-    const { q = "", page = 1, limit = 10 } = req.query;
-
-    const pageNum = Math.max(parseInt(page) || 1, 1);
-    const limitNum = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
-    const skip = (pageNum - 1) * limitNum;
-
-    const ALL_VISA_CODES = ["189", "190", "482", "491", "494", "186", "485", "407"];
-
-    const visaDocs = await visasCollection
-      .find({ visa_code: { $in: ALL_VISA_CODES } })
-      .project({ _id: 0, visa_code: 1, visa_name: 1 })
-      .toArray();
-
-    const visas = ALL_VISA_CODES.map((v) => {
-      const doc = visaDocs.find((d) => d.visa_code === v);
-      return { visa_code: v, visa_name: doc?.visa_name || `Subclass ${v}` };
-    });
-
-    const queryFilter = {
-      regions: code,
-      ...(q
-        ? {
-            $or: [
-              { title: { $regex: q, $options: "i" } },
-              { anzsco_code: { $regex: q, $options: "i" } },
-            ],
-          }
-        : {}),
-    };
-
-    const [occupations, total] = await Promise.all([
-      occupationsCollection
-        .find(queryFilter)
-        .project({
-          _id: 0,
-          anzsco_code: 1,
-          title: 1,
-          visas: 1,
-          regions: 1,
-        })
-        .skip(skip)
-        .limit(limitNum)
-        .toArray(),
-      occupationsCollection.countDocuments(queryFilter),
-    ]);
-
-    const rows = occupations.map((occ) => {
-      const row = {
-        anzsco_code: occ.anzsco_code,
-        name: occ.title,
-      };
-      ALL_VISA_CODES.forEach((visaCode) => {
-        const eligible =
-          (occ.visas || []).includes(visaCode) &&
-          (occ.regions || []).includes(code);
-        row[`Subclass ${visaCode}`] = !!eligible;
-      });
-      return row;
-    });
-
-    res.json({
-      region: code,
-      total,
-      page: pageNum,
-      limit: limitNum,
-      visas,
-      rows,
-    });
-  } catch (err) {
-    console.error("❌ State search error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ========================================================================
-// 🧩 TASK SEARCH
-// ========================================================================
-app.get("/api/task/search", async (req, res) => {
-  try {
-    const { q = "", page = 1, limit = 10 } = req.query;
-    const pageNum = Math.max(parseInt(page) || 1, 1);
-    const limitNum = Math.min(Math.max(parseInt(limit) || 10, 1), 50);
-    const skip = (pageNum - 1) * limitNum;
-
-    const query = q.trim().length > 0 ? { $text: { $search: q } } : {};
-
-    const total = await occupationsCollection.countDocuments(query);
-    const results = await occupationsCollection
-      .find(query, q ? { score: { $meta: "textScore" } } : {})
-      .project({
-        _id: 0,
-        anzsco_code: 1,
-        title: 1,
-        description: 1,
-        assessment_authorities: 1,
-        unit_group: 1,
-        major_group: 1,
-        visas: 1,
-        regions: 1,
-        score: q ? { $meta: "textScore" } : undefined,
-      })
-      .sort(q ? { score: { $meta: "textScore" } } : { title: 1 })
-      .skip(skip)
-      .limit(limitNum)
-      .toArray();
-
-    res.json({ total, page: pageNum, limit: limitNum, results });
-  } catch (err) {
-    console.error("❌ Task search error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ========================================================================
 // 🧩 CONFIG ROUTES
 // ========================================================================
 app.get("/api/config", async (req, res) => {
@@ -315,52 +86,174 @@ app.get("/api/config", async (req, res) => {
   }
 });
 
-app.get("/api/config/:key", async (req, res) => {
+// ========================================================================
+// 🧩 AUTOCOMPLETE SUGGESTIONS (title/code contains `q`)
+// ========================================================================
+app.get("/api/occupations/suggest", async (req, res) => {
+  const q = (req.query.q || "").trim();
+  if (!q) return res.json([]);
+  const regex = new RegExp(q, "i"); // substring match
+  const data = await occupationsCollection
+    .find({ $or: [{ title: regex }, { anzsco_code: regex }] })
+    .project({ _id: 0, anzsco_code: 1, title: 1 })
+    .limit(20)
+    .toArray();
+  res.json(data);
+});
+
+// ========================================================================
+// 🧩 NORMAL SEARCH (single occupation)
+// ========================================================================
+app.get("/api/occupations/search", async (req, res) => {
   try {
-    const key = req.params.key;
-    const config = await configCollection.findOne(
-      { key },
-      { projection: { _id: 0, value: 1 } }
-    );
-    if (!config) return res.status(404).json({ error: "Config not found" });
-    res.json(config.value);
+    const q = (req.query.q || "").trim();
+    if (!q) return res.status(400).json({ error: "Missing query parameter" });
+
+    const regex = new RegExp(q, "i");
+    const occupation = await occupationsCollection.findOne({
+      $or: [{ anzsco_code: regex }, { title: regex }],
+    });
+
+    if (!occupation)
+      return res.status(404).json({ error: "Occupation not found" });
+
+    const { _id, ...data } = occupation;
+    res.json(data);
   } catch (err) {
-    console.error("❌ Config key fetch error:", err);
+    console.error("❌ Occupation search error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 // ========================================================================
-// 🧩 VISA KEYS FROM CONFIG (optional)
+// 🧩 ADMIN CRUD
 // ========================================================================
-app.get("/api/config/visa_keys/:subclass", async (req, res) => {
+
+// ➕ CREATE
+app.post("/api/occupations", async (req, res) => {
   try {
-    const { subclass } = req.params;
-    const configDoc = await configCollection.findOne(
-      { visa_keys: { $exists: true } },
-      { projection: { _id: 0, visa_keys: 1 } }
-    );
-
-    if (!configDoc || !Array.isArray(configDoc.visa_keys)) {
-      return res.status(404).json({ error: "Visa keys not found in config" });
+    const data = req.body;
+    if (!data.anzsco_code || !data.title) {
+      return res.status(400).json({ success: false, message: "ANZSCO code and title required." });
     }
+    const existing = await occupationsCollection.findOne({ anzsco_code: data.anzsco_code });
+    if (existing)
+      return res.status(409).json({ success: false, message: "Occupation with this code already exists." });
 
-    const visa = configDoc.visa_keys.find(
-      (v) => String(v.subclass) === String(subclass)
-    );
-
-    if (!visa) {
-      return res
-        .status(404)
-        .json({ error: `Visa subclass ${subclass} not found in visa_keys` });
-    }
-
-    res.status(200).json(visa);
+    await occupationsCollection.insertOne({
+      ...data,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    res.json({ success: true, message: "Occupation created successfully." });
   } catch (err) {
-    console.error("❌ Error fetching visa from config:", err);
-    res.status(500).json({ error: "Server error while fetching visa details" });
+    console.error("❌ Error creating occupation:", err);
+    res.status(500).json({ success: false, message: "Server error while creating occupation." });
   }
 });
+
+// ✏️ UPDATE (partial OK)
+app.put("/api/occupations/:code", async (req, res) => {
+  try {
+    const code = req.params.code;
+    const update = req.body;
+    const result = await occupationsCollection.updateOne(
+      { anzsco_code: code },
+      { $set: { ...update, updatedAt: new Date() } }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).json({ success: false, message: "Occupation not found." });
+
+    res.json({ success: true, message: "Occupation updated successfully." });
+  } catch (err) {
+    console.error("❌ Error updating occupation:", err);
+    res.status(500).json({ success: false, message: "Server error while updating occupation." });
+  }
+});
+
+// 🗑 DELETE
+app.delete("/api/occupations/:code", async (req, res) => {
+  try {
+    const code = req.params.code;
+    const result = await occupationsCollection.deleteOne({ anzsco_code: code });
+    if (result.deletedCount === 0)
+      return res.status(404).json({ success: false, message: "Occupation not found." });
+
+    res.json({ success: true, message: "Occupation deleted successfully." });
+  } catch (err) {
+    console.error("❌ Error deleting occupation:", err);
+    res.status(500).json({ success: false, message: "Server error while deleting occupation." });
+  }
+});
+
+// 📋 PAGINATED LIST for Admin table
+// GET /api/occupations?q=&page=1&limit=10
+app.get("/api/occupations", async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1"), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "10"), 1), 100);
+    const q = (req.query.q || "").trim();
+
+    const filter = q
+      ? { $or: [{ title: new RegExp(q, "i") }, { anzsco_code: new RegExp(q, "i") }] }
+      : {};
+
+    const total = await occupationsCollection.countDocuments(filter);
+    const items = await occupationsCollection
+      .find(filter)
+      .project({ _id: 0 })
+      .sort({ title: 1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray();
+
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
+    });
+  } catch (err) {
+    console.error("❌ Error fetching occupations:", err);
+    res.status(500).json({ success: false, message: "Server error while fetching occupations." });
+  }
+});
+
+// (Legacy) fetch all — keep if you still need it
+app.get("/api/occupations/all", async (req, res) => {
+  try {
+    const all = await occupationsCollection.find({}).project({ _id: 0 }).toArray();
+    res.json(all);
+  } catch (err) {
+    console.error("❌ Error fetching occupations:", err);
+    res.status(500).json({ success: false, message: "Server error while fetching occupations." });
+  }
+});
+
+// 🧩 BULK IMPORT (optional but recommended)
+app.post("/api/occupations/bulk", async (req, res) => {
+  try {
+    const occupations = req.body;
+    if (!Array.isArray(occupations))
+      return res.status(400).json({ success: false, message: "Expected array" });
+
+    const ops = occupations.map(o => ({
+      updateOne: {
+        filter: { anzsco_code: o.anzsco_code },
+        update: { $set: { ...o, updatedAt: new Date() } },
+        upsert: true
+      }
+    }));
+
+    await occupationsCollection.bulkWrite(ops);
+    res.json({ success: true, message: "Bulk import completed successfully." });
+  } catch (err) {
+    console.error("❌ Bulk import error:", err);
+    res.status(500).json({ success: false, message: "Server error during bulk import." });
+  }
+});
+
 
 // ========================================================================
 // 🚀 START SERVER
