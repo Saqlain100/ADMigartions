@@ -30,6 +30,7 @@ async function connectDB() {
   occupationsCollection = db.collection("Occupations");
   usersCollection = db.collection("Users");
   configCollection = db.collection("Config");
+  staticPagesCollection = db.collection("StaticPages");
 
   // NEW COLLECTIONS
   stateCollection = db.collection("State");
@@ -93,6 +94,31 @@ app.post("/api/login", async (req, res) => {
     res.status(500).json({ message: "Server error during login." });
   }
 });
+
+// ===========================================================
+// GET VISA PAGE BY SUBCLASS
+// GET /api/config/visa_keys/:subclass
+// ===========================================================
+app.get("/api/config/visa_keys/:subclass", async (req, res) => {
+  try {
+    const subclass = req.params.subclass;
+
+    const page = await staticPagesCollection.findOne(
+      { subclass: subclass },
+      { projection: { _id: 0 } }
+    );
+
+    if (!page) {
+      return res.status(404).json({ error: "Visa page not found" });
+    }
+
+    res.json(page);
+  } catch (err) {
+    console.error("❌ Error fetching visa page:", err);
+    res.status(500).json({ error: "Server error fetching visa page" });
+  }
+});
+
 
 // ========================================================================
 // CONFIG ROUTES
@@ -718,6 +744,77 @@ app.get("/api/dama/distincts", async (req, res) => {
     });
   }
 });
+// ========================================================================
+// DAMA FILTERS (for Admin Pagination + Filter UI)
+// GET /api/dama/filters
+// ========================================================================
+// ========================================================================
+// PAGINATION + FULL FILTER SUPPORT (REGION, ANZSCO, SKILL LEVEL, ETC.)
+// ========================================================================
+app.get("/api/dama", async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page || "1"), 1);
+    const limit = Math.min(parseInt(req.query.limit || "10"), 200);
+
+    const {
+      q,
+      region,
+      anzsco,
+      skill_level,
+      english,
+      pr_pathway,
+      age,
+      skills_experience,
+      tsmit_csit,
+    } = req.query;
+
+    const filter = {};
+
+    // Free-text search
+    if (q && q.trim()) {
+      const regex = new RegExp(q.trim(), "i");
+      filter.$or = [
+        { region: regex },
+        { anzsco: regex },
+        { name: regex },
+        { skill_level: regex },
+        { english: regex },
+      ];
+    }
+
+    // Apply exact filters if selected
+    if (region) filter.region = region;
+    if (anzsco) filter.anzsco = anzsco;
+    if (skill_level) filter.skill_level = skill_level;
+    if (english) filter.english = english;
+    if (pr_pathway) filter.pr_pathway = pr_pathway;
+    if (age) filter.age = age;
+    if (skills_experience) filter.skills_experience = skills_experience;
+    if (tsmit_csit) filter.tsmit_csit = tsmit_csit;
+
+    const total = await damaCollection.countDocuments(filter);
+
+    const items = await damaCollection
+      .find(filter)
+      .project({ _id: 0 })
+      .sort({ region: 1, anzsco: 1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray();
+
+    res.json({
+      items,
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    });
+  } catch (err) {
+    console.error("❌ DAMA fetch error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 
 
 // ========================================================================
